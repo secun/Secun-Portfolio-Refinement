@@ -1,0 +1,235 @@
+---
+title: "Predicting when a customer churn in a B2C business"
+tags: [data,analytics,datascience, B2C, Marketing, telco, predictive, random forest]
+output: html_document
+css: styles.css
+---
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+# run setup script
+source("_common.R")
+```
+
+## Problem to solve
+Predict churn for segments that mostly churn,specially to those on subscription contracts (month-to-month commitment). This is the original intent behind this data set.    
+The data set contained data on **customer profiling** (gender, status, tenure,...), as well as the **type of contracted services** (on-line security, multiple lines, phone service, tech support, streaming TV,...), and whether it has churned or not. 
+
+## Solution
+```{r libraries, results=FALSE}
+library(data.world) # for connecting to data world
+library(ggplot2)
+library(caret) #ML workflow
+library(dplyr)
+library(readr)
+library(broom)
+#Connecting to API from data world
+#API token not shown here
+API_TOKEN <- "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJyLWFuZC1yLXN0dWRpbzpzZWN1biIsImlzcyI6ImNsaWVudDpyLWFuZC1yLXN0dWRpbzphZ2VudDpzZWN1bjo6NWU1ZWUwMTYtODRkMy00N2FjLThjYzAtNmNlZWM2NjkzNzYwIiwiaWF0IjoxNTc0NjczMjE3LCJyb2xlIjpbInVzZXJfYXBpX2FkbWluIiwidXNlcl9hcGlfcmVhZCIsInVzZXJfYXBpX3dyaXRlIl0sImdlbmVyYWwtcHVycG9zZSI6dHJ1ZSwic2FtbCI6e319.8isH7CCN0Bve6KwB-CQAacv8j4L6DCfkR7TUnIgx-jQjGLLzgs9sbFH2Pi8O_Zg5xgO1Y6IG60P4RudNpQwyfQ"
+saved_cfg <- data.world::save_config(API_TOKEN)
+data.world::set_config(saved_cfg)
+```
+
+After some prior data transformation activities to be done on the data,to secure that data is numerical to be treated by the the algorithms, we can visualize some data:
+```{r data_pulling}
+intro_ds <- "https://data.world/secun/fmcgdataanalysis"
+dt.telco <- data.world::query(
+  data.world::qry_sql("SELECT * FROM wa_fn_usec_telco_customer_churn"),
+  dataset = intro_ds                    )
+#remove records with missing data
+dt.telco<- dt.telco[complete.cases(dt.telco),]
+
+factorVars <- c("gender","seniorcitizen", "partner", "dependents", "phoneservice", "multiplelines","internetservice", "onlinesecurity", "onlinebackup",
+                "deviceprotection","techsupport","streamingtv", "streamingmovies",
+                "contract","paperlessbilling","paymentmethod","churn")
+dt.telco[, factorVars] <- lapply(dt.telco[, factorVars], as.factor)
+d_train_int <- dt.telco[,c("tenure", "monthlycharges", "totalcharges")]
+#collect factor variables and transform data types into numerical for regression
+d_train_cat <- dt.telco[,-c(1,6,19,20)]
+dummy<- data.frame(sapply(d_train_cat,
+                          function(x) data.frame(model.matrix(~x-1,data =d_train_cat))[,-1]))
+telco_final <- cbind(d_train_int,dummy) #merge data
+telco_final <- select (telco_final, c(1:30)) #remove churn
+
+#select monthly contracts, and remove columns too
+telco_final <- filter (telco_final, contract.xOne.year== 0)
+telco_final <- filter (telco_final, contract.xTwo.year== 0)
+telco_final <- select (telco_final, -starts_with("contract.")) 
+```
+If we plot the density diagram (smilitar to histogram) for the tenure of customers (for customers on monthly contracts only), we can obtain this plot, which is the plot we would like to predict.
+```{r echo=TRUE, fig.cap = 'Figure showing density diagram of tenure, with a sharp peak in the first months.'}
+ggplot(data=telco_final)+
+  geom_density(aes(x=tenure),fill="black", alpha=0.2)+
+  labs(x = "Tenure", y = "Customers ",
+  title ="Churn declines over time")+
+  theme_secun()
+```
+One first learning, if you do a simple correlation analysis, is that tenure (eventually churn), has a **positive correlation** with total invoice value, and invoice is correlated with monthly invoice and with additional services (especially Fiber Optics, Streaming TV and streaming movies). Nothing new, customers that enjoy some specific services are more engaged and therefore are more loyal.And therefore pay more for more time!
+
+#### First model to be tested
+Let's dig deeper into this. It's quite helpful to build a **decision-tree diagram** using a recursive partitioning algorithm so you can see what can be done with specific algorithms like CART[^1] . On the bottom of the page you have a very good link where you can better understand this type of **supervised learning algorithm**, in this case a continuous variable decision tree.
+In this example, we're using 80% of our data to train the model, and 20% to test it through (to better understand this, I recommend any reader to understand the so called [train & test sampling and cross-validation technique](https://towardsdatascience.com/why-and-how-to-cross-validate-a-model-d6424b45261f), which are valid  for improving the performance of many predictive models and are widely used).
+```{r prepare-data, echo = FALSE, results=FALSE, }
+#remove records with missing data
+library(rpart)
+library(rpart.plot) #plotting regression trees
+#Prepare data
+#Splitting the data
+set.seed(157)
+training.samples <- telco_final$tenure %>% createDataPartition(p=0.8, list=FALSE) 
+train.data <- telco_final [training.samples,]
+test.data <- telco_final [-training.samples,]
+#Run regression
+model_2 <- rpart(formula = tenure~ ., data=train.data , method = "anova")
+```
+
+```{r fig.cap = 'Decision tree model where tenure of customers can be predicted based upon predictors like monthly and total charges.', fig.width= 6, fig.height=6}
+rpart.plot(model_2, type = 5, box.palette ="auto", fallen.leaves = TRUE)
+```
+
+Let me explain the chart: You see first the criteria that makes each customer to follow one branch or other (monthly/total charges). Secondly, in the leafs you can see the tenure in the leafs (in months) as well as how many (percentage.wise)  customers lie on each leaf (from less tenure to larger te nure, in dark blue).
+
+```{r plot, echo=TRUE, results=TRUE}
+#Evaluate quality of prediction
+pred <- predict(model_2, newdata = test.data)
+var.RMSE<- RMSE(pred = pred, obs = test.data$tenure)
+
+```
+
+Though the chart is simple (limited number of leafs or sub-nodes), can shed light because we can see where our customers churn from a financial perspective. Regarding  the quality of the prediction, we notice that predictions from this model are `r var.RMSE` months off from the actuals: [RMSE](https://en.wikipedia.org/wiki/Root-mean-square_deviation) `r var.RMSE`, which is quite good for customers with a lifetime of 72 months.    
+But this is misleading, as you can see from the graph below, because the data set is imbalanced, having many customers that churn during the first months, so not working well for tenures longer than 20 months.
+```{r ridges_plot, fig.width= 6, fig.height=6 , fig.cap = 'Predictions work well for short tenures, but not for longer ones, where the predictions are less sharp and uncertain.', }
+library(ggridges)
+dt.plot<-as.data.frame(cbind(test=test.data$tenure,pred=round(pred,0)))
+ggplot(dt.plot,aes(x=test, y=as.factor(pred)))+
+  geom_density_ridges()+
+    labs(y = "Predicted tenure", 
+      x ="Actual tenure", 
+      title ="Predictions worsen over time ")+
+    theme_secun()+
+    theme(axis.text.y=element_blank(),
+      axis.ticks.y=element_blank())
+```
+
+
+
+With that as a backdrop, this algorithm might be a first step to identify those customers that could churn in the 0-12 months, so very easily we are able to derive recommended (or prescriptive) course of action based upon data for them.
+
+#### Second model to be tested
+Let's use another model trying to improve our ability to forecast, the **Random Forest[^2]**. In brief, I'd say that Random Forest algorithm chooses random samples and builds trees for each sample, and finally re-arrange the results of these trees and is able to come up with one single tree[^3].      
+Having diverse trees is the key, so you need to secure that different data are allocated to different trees so subtle patterns can be identified.
+```{r Random_Forest, cache = 0, results =FALSE}
+#Splitting the data
+library(randomForest)
+# Fit the model on the training set
+set.seed(123)
+#remove total charges
+train.data <- train.data %>% select(-totalcharges)
+x<-train.data[,2:27]  #predictor variables
+y<-train.data[,1]     #response variable
+
+library(rio)
+if (file.exists("rf_file.RDS")) {
+   model_3 <- import("rf_file.RDS")
+   
+}else{
+  model_3 <- train(x,y,method ="rf",
+                 trControl=trainControl ("cv", number=10),
+                 importance=TRUE)
+
+  export(model_3,"rf_file.RDS")
+}
+pred<-predict(model_3,test.data)
+var.RMSE<- RMSE(pred = pred, obs = test.data$tenure)
+```
+Though the Random Forest model provides some guidance on the variables or features that could affect the churn, only less than 25% of the variance in the model can be explained through this model.
+ 
+Important to mention, that this model doesn't help to predict the tenure for each customer (RMSE is  `r var.RMSE` months), so looks worse than the previous one. 
+According to this, we found that  variables like multiple lines, on-line back-up and additional services, are significant for deriving the estimated tenure.    
+This is a continuous challenge in Data Science, find the model that is able to perform (predict or explain) better according to the business situation.
+```{r var_plot,eval=FALSE , results= FALSE, fig.cap = 'Figure showing how much variation of tenure can be explained through different predictors.'}
+#Let's analyze the importance of the different variables
+varImpPlot(model_3$finalModel, type = 1)
+```
+#### Third, and last, model to be tested with a new approach
+A **logistic regression model**, can predict the probability of a customer churning or not, rather than predicting when the customer would churn.       
+You can observe the results in the following graph, where we calculate the probability for churning and we assign a threshold to the point where we consider the customer as churned/not churned:
+```{r model_logit}
+telco.logit <- cbind(d_train_int,dummy) #merge data & keep churn predictor
+#remove redundant variables
+telco.logit <- select (telco.logit, -contains(".xNo")) 
+set.seed(123)
+training.samples <- createDataPartition(telco.logit$churn,times=2,p=0.8, list=FALSE) 
+train.data <- telco.logit [training.samples,]
+test.data <- telco.logit [-training.samples,]
+model_logit = glm(churn ~ ., data = train.data,family="binomial")
+
+#Let's predict test.data using model 3 trained on trained.data
+pred_prob <- predict(model_logit, type = "response", newdata = test.data)
+comparison <- cbind(test.data,pred_prob)
+data.plot <- cbind(comparison,  ID = seq.int(nrow(comparison)))
+```
+
+```{r data_plot, fig.width= 6, fig.height=6 , fig.cap = 'Figure showing predicted and actual churn: above the red line we predict all customers as churned.'}
+ggplot(data=data.plot, aes(x=ID,y=pred_prob))+
+  geom_point(aes(colour=as.factor(churn)))+
+  scale_colour_discrete(labels=c("Churned"," Non-churned"))+
+  labs(y="Predicted probability of churn",x="", colour= "Legend")+
+    geom_hline(yintercept=0.6, linetype="dashed", color = "red")+
+  theme_secun()
+#Turn probabilities into classification and calcualte confusion matrix
+comparison$pred_churn <- ifelse(comparison$pred_prob > 0.6, 1, 0)
+```
+For this specific data-set (with 20% of the total observations from the original data set), we were able to **predict churn in 81.7% of the cases**,as per the following table: 
+```{r results= TRUE}
+a<-table(comparison$pred_churn,comparison$churn)
+b<-prop.table(a)
+#
+my_tbl <- tibble::tribble(
+  ~Actual.Predicted, ~No.Churn,  ~Churn,
+           "No Churn",   "69.8%", "14.5%",
+              "Churn",    "4.4%", "11.3%"
+  )
+require(knitr)
+require(kableExtra)
+kable_styling(
+              kable(my_tbl, digits = 3, row.names = FALSE, align = "c",
+              caption = NULL, format = "html"),
+        bootstrap_options = c("striped", "hover", "condensed"),
+        position = "center", full_width = FALSE) 
+```
+
+Is it as good as it looks like? This model, that provides a Yes/No response, can be evaluated under a graph where we compare our predicted churn against the actual one, an we see that with  that could predict 50% of situations, and we see it's slightly better, but not a breakthrough.
+
+```{r  GAIN_Plot, fig.width= 7, fig.height=7 , fig.cap = 'Figure showing how good we are predicting results agains a 50/50 model (diagonal line) and the real model '}
+#library(pROC)
+#ROC <- pROC::roc(comparison$churn,comparison$pred_churn )
+# Plot the ROC curve
+#p1<-plot(ROC, col = "blue")
+#library(WVPlots)
+WVPlots::GainCurvePlot(comparison, "pred_churn","churn","Many churned customers are not being predicted")
+```
+```{r}
+library(descr)
+a<-LogRegR2(model_logit)
+```
+
+And here is where we realize that the model is not good. So the 81% is misleading again! This was already known: when we fitted the model to the trained data we only got a value of `r a$NagelkerkeR2`  for $ Nagel Kerke-R^{2}$ or `r a$CoxR2`  for $ Cox- R^{2}$  (remember the closer to 0.5 the better, this is pseudo$-R^{2}$ not the well-know $-R^{2}$ from linear regression ).    
+
+## Action    
+To wrap up, we have created several **prediction models** that are able to forecast **when (regression) and whether(classification) a customer will churn**, and we have **derived very much insight on what drives churn**, identifying which services are helping the company to retain customers, so **helping to define the services portfolio** as well as **marketing campaigns**. We can realize that we move in some point between what will happen in the future (prescriptive analytics).      
+
+This is a good example of the kind of complexity and valuable insight that can be achieved with data science algorithms, as well as how quickly and easily you are able to derive prescriptive course of action based upon data or identify situations in a predictive manner.     
+
+And here is where the business rationale may add up, because marketing campaigns run by competitors are drivers for churn that the model doesn't include now, but could be easily to  plug-in.
+
+
+>This is applicable to many B2C companies, not only telcos, that want to increase their retention rates above 90% by having multi-pronged strategies: superior CX and compelling product proposition that fits into the market.
+>Should you wanted to know more, send me Just [a few lines](mailto:secundino.sexto@outlook.com)!
+
+
+[^1]: The CART algorithm is based upon [Classification and Regression Tree (CART)](https://www.analyticsvidhya.com/blog/2016/04/tree-based-algorithms-complete-tutorial-scratch-in-python). In this case, it's pretty easy to make predictions without large and complex calculations, and the variables (drivers,features,predictors) that really influence the independent variable are easily identified by looking at the nodes of the tree. The simplicity of the tree has to be traded with the fact that capacity for predicting or accuracy is usually poor.
+
+[^2]: The Random Forest is explained [here](https://www.analyticsvidhya.com/blog/2014/06/introduction-random-forest-simplified/) in a quick manner with one example. It's a sort of "wisdom of the crowd", where the results of multiple predictors are aggregated given a better predictor.
+
+[^3]: For a comprehensive view on the different algorithms or applicable models based upon data, I'd recommend you to take a look into [MOD](http://mod.rapidminer.com/)
+
